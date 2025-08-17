@@ -1,0 +1,95 @@
+<?php
+
+class DEPT_HEAD {
+
+    public function getApprovedPRs($db, $loggedInUser) {  // $db is now passed as an argument
+        $query = "SELECT * FROM dbpis_prs WHERE dept_head = ? ORDER BY date_requested DESC";
+        $stmt = $db->prepare($query);
+        $stmt->execute([$loggedInUser]);
+        $approvedPRs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return $approvedPRs;
+    }
+
+public function handlePRAction($db, $prs_code, $action, $user_name, $modid) {
+    if (!in_array($modid, [3, 4])) {
+        return ["success" => false, "message" => "Unauthorized action."];
+    }
+
+    if ($action === "approve") {
+        if ($modid == 3) {
+            $query = "UPDATE dbpis_prs SET dept_head = ?, updated_at = NOW() WHERE prs_code = ?";
+            $params = [$user_name, $prs_code];
+        } elseif ($modid == 4) {
+            $query = "UPDATE dbpis_prs SET approved_by = ?, approval_status = 'Approved', updated_at = NOW() WHERE prs_code = ?";
+            $params = [$user_name, $prs_code];
+        } else {
+            return ["success" => false, "message" => "Invalid action or insufficient permissions."];
+        }
+    } elseif ($action === "reject") {
+        if ($modid == 3) {
+            $query = "UPDATE dbpis_prs SET approval_status = 'Rejected', updated_at = NOW(), dept_head = ? WHERE prs_code = ?";
+            $params = [$user_name, $prs_code];
+        } elseif ($modid == 4) {
+            $query = "UPDATE dbpis_prs SET approval_status = 'Rejected', updated_at = NOW(), approved_by = ? WHERE prs_code = ?";
+            $params = [$user_name, $prs_code];
+        } else {
+            return ["success" => false, "message" => "Invalid action or insufficient permissions."];
+        }
+    } else {
+        return ["success" => false, "message" => "Invalid action or insufficient permissions."];
+    }
+
+    $stmt = $db->prepare($query);
+    $stmt->execute($params);
+
+    return ["success" => $stmt->rowCount() > 0];
+}
+
+
+    public function resetDeptHead($db, $prs_code) {
+        try {
+            // SQL query to update dept_head to NULL for the given prs_code
+            $query = "UPDATE dbpis_prs SET dept_head = NULL WHERE prs_code = ?";
+            $stmt = $db->prepare($query);
+            $stmt->execute([$prs_code]);
+
+            // Check if any rows were affected (i.e., ensure the PR exists)
+            if ($stmt->rowCount() > 0) {
+                return ["success" => true, "message" => "Department Head has been reset to NULL successfully."];
+            } else {
+                return ["success" => false, "message" => "No matching PR found or Dept Head was already NULL."];
+            }
+        } catch (PDOException $e) {
+            return ["success" => false, "message" => "Error: " . $e->getMessage()];
+        }
+    }
+
+        public function resetApprovalOnly($db, $prs_code) {
+        try {
+            $query = "UPDATE dbpis_prs 
+                      SET approval_status = 'pending', approved_by = NULL 
+                      WHERE prs_code = ?";
+            $stmt = $db->prepare($query);
+            $stmt->execute([$prs_code]);
+
+            if ($stmt->rowCount() > 0) {
+                return ["success" => true, "message" => "Approval status reset to pending, Approved By set to NULL."];
+            } else {
+                return ["success" => false, "message" => "No matching PR or already in pending state."];
+            }
+        } catch (PDOException $e) {
+            return ["success" => false, "message" => "Error: " . $e->getMessage()];
+        }
+    }
+
+    function getLatestPRs($db) {
+    try {
+        $query = "SELECT * FROM dbpis_prs ORDER BY created_at DESC LIMIT 10";
+        $stmt = $db->prepare($query);
+        $stmt->execute();
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        return []; // You can also log the error if needed
+    }
+}
+}

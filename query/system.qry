@@ -1,0 +1,283 @@
+<?php
+ 
+    class SYSTEM {
+
+    function get_validateuser($db, $username, $password) {
+    // Set Manila timezone and get current timestamp
+    date_default_timezone_set('Asia/Manila');
+    $current_timestamp = date('Y-m-d H:i:s');
+
+    // Log login attempt
+    error_log("Login attempt for username: $username at $current_timestamp\n", 3, 'debug.log');
+
+    // Fetch user with formatted name
+    $query = "
+        SELECT 
+            ua.uaid, 
+            ua.username, 
+            ua.password, 
+            ua.status, 
+            ua.modid, 
+            ua.position, 
+            d.dept_name,
+            ua.failed_attempts,
+            ua.lock_until,
+            ua.last_activity,
+            CONCAT(
+                s.firstname,
+                ' ',
+                IF(s.midname IS NOT NULL AND s.midname != '', CONCAT(s.midname, ' '), ''),
+                s.surname,
+                IF(s.extension IS NOT NULL AND s.extension != '', CONCAT(' ', s.extension), '')
+            ) AS name
+        FROM dbpis_useraccounts ua
+        LEFT JOIN dbpis_department d ON ua.dept_id = d.dept_id
+        LEFT JOIN dbpis_staff s ON ua.name = s.staff_id
+        WHERE ua.username = ?
+    ";
+
+    $stmt = $db->prepare($query);
+    $stmt->execute([$username]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    // If user not found
+    if (!$user) {
+        error_log("User not found: $username at $current_timestamp\n", 3, 'debug.log');
+        return false;
+    }
+
+    // Update last activity timestamp
+    $updateQuery = "UPDATE dbpis_useraccounts SET last_activity = ? WHERE uaid = ?";
+    $updateStmt = $db->prepare($updateQuery);
+    $updateStmt->execute([$current_timestamp, $user['uaid']]);
+
+    // Check if account is locked
+    if ($user['lock_until'] && strtotime($user['lock_until']) > time()) {
+        error_log("Account locked for username: $username until " . $user['lock_until'] . " at $current_timestamp\n", 3, 'debug.log');
+        return 'locked';
+    }
+
+    // Reset lock if expired
+    if ($user['lock_until'] && strtotime($user['lock_until']) <= time()) {
+        $resetQuery = "UPDATE dbpis_useraccounts SET failed_attempts = 0, lock_until = NULL WHERE uaid = ?";
+        $resetStmt = $db->prepare($resetQuery);
+        $resetStmt->execute([$user['uaid']]);
+        $user['failed_attempts'] = 0;
+        $user['lock_until'] = null;
+        error_log("Lock expired, resetting failed attempts for username: $username at $current_timestamp\n", 3, 'debug.log');
+    }
+
+    // Validate password (plaintext comparison - consider using password_verify() with hashed passwords)
+    if ($password === $user['password']) {
+        // Reset failed attempts on successful login
+        $updateQuery = "UPDATE dbpis_useraccounts SET failed_attempts = 0, lock_until = NULL, last_activity = ? WHERE uaid = ?";
+        $updateStmt = $db->prepare($updateQuery);
+        $updateStmt->execute([$current_timestamp, $user['uaid']]);
+
+        // Return user data with properly formatted name
+        return $user;
+    } else {
+        // Increment failed attempts
+        $failed_attempts = $user['failed_attempts'] + 1;
+        $lock_duration = 1 * 60; // 1 minute in seconds
+        $lock_until = ($failed_attempts >= 3) ? date('Y-m-d H:i:s', time() + $lock_duration) : null;
+
+        // Update failed attempts
+        $updateQuery = "UPDATE dbpis_useraccounts SET failed_attempts = ?, lock_until = ? WHERE uaid = ?";
+        $updateStmt = $db->prepare($updateQuery);
+        $updateStmt->execute([$failed_attempts, $lock_until, $user['uaid']]);
+
+        error_log("Failed login attempt #$failed_attempts for username: $username at $current_timestamp\n", 3, 'debug.log');
+
+        return false;
+    }
+}
+
+
+function read_debug_log($log_file = 'authentication/debug.log') {
+  if (file_exists($log_file)) {
+      // If the file exists, read and return its content
+      $log_content = file_get_contents($log_file);
+      // Split the log into an array by newlines and filter out empty entries
+      return array_filter(explode("\n", $log_content), function($entry) {
+          return !empty(trim($entry));  // Only include non-empty entries
+      });
+  } else {
+      // If the file doesn't exist, return a message
+      return ["No log file found at $log_file."];
+  }
+}
+
+public function getAllUsers($db) {
+    try {
+        $sql = "SELECT 
+    u.uaid, 
+    CASE 
+        WHEN s.staff_id IS NULL THEN u.name
+        ELSE CONCAT(
+            s.firstname,
+            ' ',
+            IF(s.midname IS NOT NULL AND s.midname != '', CONCAT(s.midname, ' '), ''),
+            s.surname,
+            IF(s.extension IS NOT NULL AND s.extension != '', CONCAT(' ', s.extension), '')
+        )
+    END AS name,
+    u.username, 
+    u.position, 
+    u.status
+FROM 
+    dbpis_useraccounts u
+LEFT JOIN 
+    dbpis_staff s ON u.name = s.staff_id
+WHERE 
+    u.modid != 0";
+        $stmt = $db->prepare($sql);
+        $stmt->execute();
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        return ["error" => "Failed to fetch users: " . $e->getMessage()];
+    }
+}
+
+function deleteUserAccount($db, $uaid) {
+    $query = "DELETE FROM dbpis_useraccounts WHERE uaid = ?";
+    $stmt = $db->prepare($query);
+    return $stmt->execute([$uaid]);
+}
+
+function getUserDetails($db, $uaid) {
+    $query = "SELECT name, username, position FROM dbpis_useraccounts WHERE uaid = ?";
+    $stmt = $db->prepare($query);
+    $stmt->execute([$uaid]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);  // Return user details as an associative array
+}
+
+function getUserMenus($db, $modid) {
+    $query = "SELECT menu_name, menu_icon, menu_link FROM dbpis_menusidebar WHERE modid = ?";
+    $stmt = $db->prepare($query);
+    $stmt->execute([$modid]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC); // Return all menu items as an associative array
+}
+
+
+function getUserAccountDetails($db, $uaid) {
+    $query = "SELECT * FROM dbpis_useraccounts WHERE uaid = ?";
+    $stmt = $db->prepare($query);
+    $stmt->execute([$uaid]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+
+function addUserAccount($db, $name, $username, $password, $status, $modid, $position, $dept_id) {
+    $query = "INSERT INTO dbpis_useraccounts (name, username, password, status, modid, position, dept_id) 
+              VALUES (?, ?, ?, ?, ?, ?, ?)";
+    $stmt = $db->prepare($query);
+    return $stmt->execute([$name, $username, $password, $status, $modid, $position, $dept_id]);
+}
+
+function addStaffMember($db, $surname, $midname, $firstname, $extension, $dept_id, $staff_email) {
+    $query = "INSERT INTO dbpis_staff (surname, midname, firstname, extension, dept_id, staff_email)
+              VALUES (?, ?, ?, ?, ?, ?)";
+    $stmt = $db->prepare($query);
+    return $stmt->execute([$surname, $midname, $firstname, $extension, $dept_id, $staff_email]);
+}
+
+
+function getDepartments($db) {
+    $query = "SELECT dept_id, dept_name, dept_group FROM dbpis_department";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+
+
+function updateUserAccount($db, $uaid, $name, $username, $password, $status, $modid, $position) {
+    $query = "UPDATE dbpis_useraccounts
+              SET name = ?, username = ?, password = ?, status = ?, modid = ?, position = ?
+              WHERE uaid = ?";
+    $stmt = $db->prepare($query);
+    return $stmt->execute([$name, $username, $password, $status, $modid, $position, $uaid]);
+}
+
+
+function getTotalUsersCount($db) {
+    $query = "SELECT COUNT(*) AS total_users FROM dbpis_useraccounts";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC)['total_users'];
+}
+
+function getTotalActiveUsersCount($db) {
+    $query = "SELECT COUNT(*) AS total_active_users FROM dbpis_useraccounts WHERE status = 1";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC)['total_active_users'];
+}
+
+function getTotalInactiveUsersCount($db) {
+    $query = "SELECT COUNT(*) AS total_inactive_users FROM dbpis_useraccounts WHERE status = 0";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC)['total_inactive_users'];
+}
+
+function getTotalStaffCount($db) {
+    $query = "SELECT COUNT(*) AS total_staff FROM dbpis_staff";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC)['total_staff'];
+}
+
+function getTotalMenu($db) {
+    $query = "SELECT COUNT(*) AS total_menus FROM dbpis_menusidebar";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC)['total_menus'];
+}
+
+function getTotalPositions($db) {
+    $query = "SELECT COUNT(DISTINCT position) AS total_positions FROM dbpis_useraccounts";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC)['total_positions'];
+}
+
+  public function getStaff($db) {
+    try {
+      $sql = "SELECT staff_id, surname, midname, firstname, extension, dept_id, staff_email FROM dbpis_staff";
+      $stmt = $db->prepare($sql);
+      $stmt->execute();
+      return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+      // Log error or handle it gracefully
+      error_log("getStaff Error: " . $e->getMessage());
+      return [];
+    }
+  }
+
+function fetchAllEmployees($db) {
+    $stmt = $db->query("
+        SELECT 
+            s.staff_id,
+            CONCAT(
+                s.firstname, 
+                ' ', 
+                IFNULL(s.midname, ''), 
+                IF(s.midname IS NOT NULL, ' ', ''), 
+                s.surname,
+                IF(s.extension IS NOT NULL AND s.extension != '', CONCAT(' ', s.extension), '')
+            ) AS full_name,
+            s.dept_id,
+            d.dept_name,
+            d.dept_group,
+            s.staff_email 
+        FROM dbpis_staff s
+        LEFT JOIN dbpis_department d ON s.dept_id = d.dept_id
+    ");
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+
+
+}

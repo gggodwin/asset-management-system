@@ -1,0 +1,1 @@
+[2025-04-24 14:15:14] Database error adding item: SQLSTATE[23000]: Integrity constraint violation: 1048 Column 'barcode' cannot be null

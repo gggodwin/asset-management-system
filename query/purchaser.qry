@@ -1,0 +1,244 @@
+<?php
+
+class PURCHASER {
+
+
+
+    public function getPurchaseSummary($db) {
+        // Total Approved PRs
+        $totalApprovedPRsQuery = "SELECT COUNT(DISTINCT prs.prs_code)
+                                FROM dbpis_prs prs
+                                JOIN dbpis_prsdetails prd ON prs.prs_code = prd.prs_code
+                                WHERE prs.approval_status = 'Approved'
+                                    AND prd.unit_price IS NOT NULL
+                                    AND prd.total_price IS NOT NULL;";
+        $totalApprovedPRs = $db->query($totalApprovedPRsQuery)->fetchColumn();
+
+        // Pending Price Updates (PRs with dept_head but without total and unit price)
+        $pendingPriceUpdatesQuery = "SELECT COUNT(DISTINCT prs.prs_code)
+                                    FROM dbpis_prs AS prs
+                                    LEFT JOIN dbpis_prsdetails AS prd ON prs.prs_code = prd.prs_code
+                                    WHERE prs.dept_head IS NOT NULL
+                                    AND prs.approval_status = 'Approved'
+                                    AND (prd.unit_price IS NULL OR prd.total_price IS NULL);";
+        $pendingPriceUpdates = $db->query($pendingPriceUpdatesQuery)->fetchColumn();
+
+        // Supplier Count
+        $supplierCountQuery = "SELECT COUNT(*) FROM dbpis_supplier";
+        $supplierCount = $db->query($supplierCountQuery)->fetchColumn();
+
+        // Count of all Approved PRs
+        $approvedPRsQuery = "SELECT COUNT(*) FROM dbpis_prs WHERE approval_status = 'Approved';";
+        $approvedPRs = $db->query($approvedPRsQuery)->fetchColumn();
+
+        return [
+            'total_approved_prs' => $totalApprovedPRs,
+            'pending_price_updates' => $pendingPriceUpdates,
+            'supplier_count' => $supplierCount,
+            'upcoming_pr_deadlines' => $approvedPRs // Renamed key still returning approved PRs count
+        ];
+    }
+
+
+function fetchAllPRs($db) {
+    $stmt = $db->prepare("
+        SELECT 
+            prs.*, 
+            prd_summary.unit_price, 
+            prd_summary.total_price, 
+            prd_summary.supplier,
+            CASE 
+                WHEN prd_status_check.has_status_2_or_3 = 1 THEN 1 
+                ELSE 0 
+            END AS has_status_2
+        FROM dbpis_prs AS prs 
+        LEFT JOIN (
+            SELECT 
+                prd.prs_code, 
+                prd.unit_price, 
+                prd.total_price, 
+                prd.supplier 
+            FROM dbpis_prsdetails prd 
+            INNER JOIN (
+                SELECT 
+                    prs_code, 
+                    MIN(CASE 
+                        WHEN unit_price IS NULL OR total_price IS NULL OR supplier IS NULL THEN 0 
+                        ELSE 1 
+                    END) AS priority 
+                FROM dbpis_prsdetails 
+                GROUP BY prs_code
+            ) ranked_prs ON prd.prs_code = ranked_prs.prs_code 
+            WHERE (
+                (ranked_prs.priority = 0 AND 
+                 (prd.unit_price IS NULL OR prd.total_price IS NULL OR prd.supplier IS NULL)) 
+                OR ranked_prs.priority = 1
+            ) 
+            GROUP BY prd.prs_code
+        ) AS prd_summary ON prs.prs_code = prd_summary.prs_code
+        LEFT JOIN (
+            SELECT prs_code, 
+                   MAX(CASE WHEN status IN (2, 3) THEN 1 ELSE 0 END) AS has_status_2_or_3 
+            FROM dbpis_prsdetails 
+            GROUP BY prs_code
+        ) AS prd_status_check ON prs.prs_code = prd_status_check.prs_code
+        WHERE prs.dept_head IS NOT NULL 
+          AND prs.approval_status IN ('Approved', 'Canceled') 
+        ORDER BY 
+            CASE 
+                WHEN prs.approval_status = 'Approved' THEN 1 
+                WHEN prs.approval_status = 'Canceled' THEN 2 
+                ELSE 3 
+            END,
+            (prd_summary.unit_price IS NULL OR prd_summary.total_price IS NULL OR prd_summary.supplier IS NULL) DESC, 
+            prs.prs_code;
+    ");
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+
+
+    public function updatePurchaseRequisitionDetails($db, $prs_code, $item_codes, $suppliers, $unit_prices, $total_prices, $quantities, $statuses) {
+        $query = "
+            UPDATE dbpis_prsdetails
+            SET supplier = ?, unit_price = ?, total_price = ?, quantity = ?, status = ?
+            WHERE prs_code = ? AND item_code = ?
+        ";
+
+        $stmt = $db->prepare($query);
+
+        foreach ($item_codes as $index => $item_code) {
+            $supplier = $suppliers[$index];
+            $unit_price = $unit_prices[$index];
+            $total_price = $total_prices[$index];
+            $quantity = $quantities[$index];
+            $status = $statuses[$index]; // Get the status for this item
+
+            // Execute the query with the additional status parameter
+            if (!$stmt->execute([$supplier, $unit_price, $total_price, $quantity, $status, $prs_code, $item_code])) {
+                error_log("Failed to update PRS details: " . implode(", ", $stmt->errorInfo()));
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+
+
+        public function updateSupplier($db, $supplier_id, $supplier_name, $contact_name, $contact_email, $contact_phone, $address, $status) {
+            $stmt = $db->prepare("UPDATE dbpis_supplier
+                                SET supplier_name = ?,
+                                    contact_name = ?,
+                                    contact_email = ?,
+                                    contact_phone = ?,
+                                    address = ?,
+                                    status = ?
+                                WHERE supplier_id = ?");
+
+            // Execute the query with the provided parameters
+            return $stmt->execute([
+                $supplier_name,
+                $contact_name,
+                $contact_email,
+                $contact_phone,
+                $address,
+                $status,
+                $supplier_id
+            ]);
+        }
+
+
+        public function insertSupplier($db, $supplier_name, $contact_name, $contact_email, $contact_phone, $address) {
+            $stmt = $db->prepare("INSERT INTO dbpis_supplier (supplier_name, contact_name, contact_email, contact_phone, address)
+                                  VALUES (?, ?, ?, ?, ?)");
+
+            return $stmt->execute([
+                $supplier_name,
+                $contact_name,
+                $contact_email,
+                $contact_phone,
+                $address
+            ]);
+        }
+
+        public function fetchAllSuppliers($db) {
+            $stmt = $db->prepare("SELECT * FROM dbpis_supplier ORDER BY supplier_name ASC");
+            $stmt->execute();
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        // Fetch PRS details by PRS code
+        public function fetchPRDetailsByCode($db, $prs_code) {
+            $stmt = $db->prepare('SELECT
+                    pd.item_code,
+                    pd.item_description,
+                    pd.quantity,
+                    pd.unit_type,
+                    pd.supplier,
+                    pd.unit_price,
+                    pd.total_price,
+                    pd.status,
+                    i.id AS item_id  -- Include item id from dbpis_items
+                FROM dbpis_prsdetails pd
+                JOIN dbpis_items i ON pd.item_code = i.barcode  -- Join with dbpis_items on item_code
+                WHERE pd.prs_code = ?');
+
+            $stmt->execute([$prs_code]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+
+        public function fetchAllItems($db) {
+            $sql = "
+                SELECT
+                    i.*,
+                    cg.itcat_name AS category_name
+                FROM dbpis_items i
+                LEFT JOIN dbpis_item_suppliers isup ON i.id = isup.item_id
+                LEFT JOIN dbpis_item_category cg ON i.category = cg.itcat_id
+                
+            ";
+
+            $stmt = $db->prepare($sql);
+            $stmt->execute();
+
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        public function insertItemSupplier($db, $itemId, $supplierId) {
+            $sql = "INSERT INTO dbpis_item_suppliers (item_id, supplier_id)
+                    VALUES (:item_id, :supplier_id)";
+
+            $stmt = $db->prepare($sql);
+            $stmt->bindParam(':item_id', $itemId);
+            $stmt->bindParam(':supplier_id', $supplierId);
+
+            return $stmt->execute();
+        }
+
+            public function updatePurchaseRemarks($db, $prsCode, $purchaseRemarks) {
+        // Prepare the SQL query to update purchase_remarks
+        $query = "UPDATE dbpis_prs SET purchase_remarks = :purchaseRemarks WHERE prs_code = :prsCode";
+        
+        // Prepare the statement
+        $stmt = $db->prepare($query);
+        
+        // Bind parameters
+        $stmt->bindParam(':purchaseRemarks', $purchaseRemarks);
+        $stmt->bindParam(':prsCode', $prsCode);
+
+        // Execute the query and return true if successful, otherwise false
+        return $stmt->execute();
+    }
+
+
+
+
+
+
+
+
+}
+?>

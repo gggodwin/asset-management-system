@@ -1,0 +1,52 @@
+Options -Indexes
+
+RewriteEngine Off
+
+<IfModule mod_headers.c>
+    # Set Cache-Control headers for PHP files to help with back button issue after logout
+    <FilesMatch "\.php$">
+        Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+        Header set Pragma "no-cache"
+        Header set Expires "0"
+    </FilesMatch>
+</IfModule>
+
+# Redirect all requests to the DBAMS folder if not already in it (Case-insensitive)
+RewriteCond %{REQUEST_URI} !^/dbams/ [NC]
+RewriteRule ^(.*)$ /dbams/$1 [L]
+
+# Default redirection to the logout page when accessing the root of DBAMS folder
+RewriteCond %{REQUEST_URI} ^/dbams/$ [NC]
+RewriteRule ^ /dbams/utilities/logout.php [L,R=302]
+
+# Restrict direct access to login.php unless it's an AJAX request
+RewriteCond %{REQUEST_URI} ^/dbams/admin/login\.php$ [NC]
+RewriteCond %{HTTP:X-Requested-With} !^XMLHttpRequest$ [NC]
+RewriteRule ^ /dbams/utilities/logout.php [L,R=302]
+
+# Block access to .log, .ini, and .htaccess files and redirect to logout
+RewriteCond %{REQUEST_URI} \.(log|ini|htaccess)$ [NC]
+RewriteRule ^ /dbams/utilities/logout.php [L,R=302]
+
+# Block direct access to PHP files in any directory under /dbams/
+# unless it's an AJAX request or an iframe request (modern browsers).
+RewriteCond %{REQUEST_URI} ^/dbams/.*\.php$ [NC]
+RewriteCond %{REQUEST_URI} !^/dbams/utilities/logout\.php$ [NC] # Exclude logout.php itself
+RewriteCond %{HTTP:X-Requested-With} !^XMLHttpRequest$ [NC]     # Allow AJAX
+RewriteCond %{HTTP:Sec-Fetch-Dest} !^(iframe|frame)$ [NC]       # Allow iframes
+RewriteRule ^ /dbams/utilities/logout.php [L,R=302]             
+
+# Handle 403 Forbidden errors by redirecting to logout
+ErrorDocument 403 /dbams/utilities/logout.php
+
+# Catch-all rule: Redirect any invalid URL (non-existent file or directory) to the logout page
+RewriteCond %{REQUEST_URI} !\.(js\.map|css\.map|map|ico)$ [NC] # ADDED: Ignore .map and .ico files
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteCond %{REQUEST_URI} !^/dbams/utilities/logout\.php$ [NC]
+RewriteRule ^ /dbams/utilities/logout.php [L,R=302]
+
+# Restrict access to any file in /dbams/utilities/ except logout.php
+RewriteCond %{REQUEST_URI} ^/dbams/utilities/.*$ [NC]
+RewriteCond %{REQUEST_URI} !^/dbams/utilities/logout\.php$ [NC] 
+RewriteRule ^ /dbams/ [L,R=302]

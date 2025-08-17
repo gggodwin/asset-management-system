@@ -1,0 +1,696 @@
+<?php
+class REQUESTOR {
+
+function getUserPRStats($db, $requested_by, $modid) {
+    if (in_array($modid, [0, 3])) {
+        $query = "
+            SELECT
+                COUNT(*) AS total_prs,
+                SUM(approval_status = 'Pending') AS pending_prs,
+                SUM(approval_status = 'Approved') AS approved_prs,
+                SUM(approval_status = 'Rejected') AS rejected_prs
+            FROM dbpis_prs
+        ";
+        $stmt = $db->prepare($query);
+        $stmt->execute();
+    } elseif ($modid == 4) {
+        $query = "
+            SELECT
+                COUNT(*) AS total_prs,
+                SUM(approval_status = 'Pending') AS pending_prs,
+                SUM(approval_status = 'Approved') AS approved_prs,
+                SUM(approval_status = 'Rejected') AS rejected_prs
+            FROM dbpis_prs
+            WHERE dept_head IS NOT NULL AND TRIM(dept_head) <> ''
+        ";
+        $stmt = $db->prepare($query);
+        $stmt->execute();
+    } else {
+        $query = "
+            SELECT
+                COUNT(*) AS total_prs,
+                SUM(approval_status = 'Pending') AS pending_prs,
+                SUM(approval_status = 'Approved') AS approved_prs,
+                SUM(approval_status = 'Rejected') AS rejected_prs
+            FROM dbpis_prs
+            WHERE requested_by = ?
+        ";
+        $stmt = $db->prepare($query);
+        $stmt->execute([$requested_by]);
+    }
+
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+
+
+
+    function getPRDetailsByCode($db, $prs_code) {
+        // Check if prs_code is provided
+        if (empty($prs_code)) {
+            return ['error' => 'PR Code not provided.'];
+        }
+
+        // Fetch PR details based on prs_code
+        $stmt = $db->prepare("SELECT p.*, u.unit_name FROM dbpis_prs p LEFT JOIN dbpis_unit u ON p.unit_id = u.unit_id WHERE p.prs_code = ?");
+        $stmt->execute([$prs_code]);
+        $prsData = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$prsData) {
+            return ['error' => "No purchase requisition found with PR Code: $prs_code."];
+        }
+
+        // Fetch PR items from `dbpis_prsdetails` for the selected PR
+        $stmtItems = $db->prepare("SELECT * FROM dbpis_prsdetails WHERE prs_code = ?");
+        $stmtItems->execute([$prs_code]);
+        $prsItems = $stmtItems->fetchAll(PDO::FETCH_ASSOC);
+
+        // Return both PR details and PR items
+        return [
+            'prsData' => $prsData,
+            'prsItems' => $prsItems
+        ];
+    }
+
+
+
+function fetchAllPRs($db) {
+    if (session_status() == PHP_SESSION_NONE) {
+        session_start();
+    }
+
+    $modid = $_SESSION['modid'] ?? 0;
+    $requestor = $_SESSION['name'] ?? '';
+
+    $params = [];
+    $whereClause = '';
+    
+    if ($modid != 4) {
+        // Requestor mode - filter by requested_by
+        $whereClause = " WHERE p.requested_by = ?";
+        $params[] = $requestor;
+    } else {
+        // Admin mode - include only appropriate statuses
+        $whereClause = " WHERE (
+            (p.dept_head IS NOT NULL AND TRIM(p.dept_head) <> '' AND (p.approved_by IS NULL OR TRIM(p.approved_by) = ''))
+            OR p.approval_status = 'Approved'
+            OR (p.approval_status = 'Rejected' AND p.approved_by IS NOT NULL)
+        )";
+    }
+
+    $query = "
+        SELECT 
+            p.*, 
+            u.unit_name,
+
+            -- Sum of prices
+            (SELECT SUM(d.unit_price) FROM dbpis_prsdetails d WHERE d.prs_code = p.prs_code) AS unit_price,
+            (SELECT SUM(d.total_price) FROM dbpis_prsdetails d WHERE d.prs_code = p.prs_code) AS total_price,
+
+            -- Valid price counts (for modid 4 use)
+            (
+                SELECT COUNT(*) 
+                FROM dbpis_prsdetails d 
+                WHERE d.prs_code = p.prs_code 
+                AND (d.unit_price IS NOT NULL AND d.unit_price > 0)
+            ) AS valid_unit_prices_count,
+
+            (
+                SELECT COUNT(*) 
+                FROM dbpis_prsdetails d 
+                WHERE d.prs_code = p.prs_code 
+                AND (d.total_price IS NOT NULL AND d.total_price > 0)
+            ) AS valid_total_prices_count,
+
+            -- Purchased items
+            IF(purchased_sub.count > 0, 1, 0) AS has_purchased,
+
+            -- Receive status
+            CASE 
+                WHEN received_sub.match_count = received_sub.total_count THEN 'Fully Received'
+                WHEN received_sub.partial_match_count > 0 THEN 'Partially Received'
+                ELSE 'Not Received'
+            END AS receive_status,
+
+            -- Deploy status
+            CASE 
+                WHEN deployed_sub.total_deployed = deployed_sub.total_received AND deployed_sub.total_received > 0 THEN 'Fully Deployed'
+                WHEN deployed_sub.total_deployed > 0 THEN 'Partially Deployed'
+                ELSE 'Not Deployed'
+            END AS deploy_status
+
+        FROM dbpis_prs p
+        LEFT JOIN dbpis_unit u ON p.unit_id = u.unit_id
+
+        -- Purchased items subquery
+        LEFT JOIN (
+            SELECT 
+                d.prs_code,
+                COUNT(*) AS count
+            FROM 
+                dbpis_prsdetails d
+            WHERE 
+                d.status IN (1, 2, 3)
+                AND d.unit_price IS NOT NULL AND d.unit_price != 0
+                AND d.total_price IS NOT NULL AND d.total_price != 0
+            GROUP BY 
+                d.prs_code
+        ) AS purchased_sub ON purchased_sub.prs_code = p.prs_code
+
+        -- Received items subquery
+        LEFT JOIN (
+            SELECT 
+                sub.prs_code,
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN sub.received_qty >= sub.requested_qty THEN 1 ELSE 0 END) AS match_count,
+                SUM(CASE WHEN sub.received_qty > 0 AND sub.received_qty < sub.requested_qty THEN 1 ELSE 0 END) AS partial_match_count
+            FROM (
+                SELECT 
+                    d.prs_code,
+                    d.item_code,
+                    d.quantity AS requested_qty,
+                    IFNULL(SUM(r.quantity), 0) AS received_qty
+                FROM 
+                    dbpis_prsdetails d
+                LEFT JOIN dbpis_prs p ON d.prs_code = p.prs_code
+                LEFT JOIN dbpis_rr_details r 
+                    ON r.prs_id = p.prs_id 
+                    AND r.particulars = d.item_code
+                WHERE 
+                    d.status != 0
+                GROUP BY 
+                    d.prs_code, d.item_code
+            ) AS sub
+            GROUP BY 
+                sub.prs_code
+        ) AS received_sub ON received_sub.prs_code = p.prs_code
+
+        -- Deployed items subquery
+        LEFT JOIN (
+            SELECT 
+                p.prs_id,
+                COUNT(DISTINCT r.rr_detail_id) AS total_received,
+                COUNT(DISTINCT rd.rr_detail_id) AS total_deployed
+            FROM dbpis_prs p
+            LEFT JOIN dbpis_rr_details r 
+                ON r.prs_id = p.prs_id
+            LEFT JOIN dbpis_df df 
+                ON FIND_IN_SET(r.rr_no, df.rr_no) > 0
+            LEFT JOIN dbpis_rr_details rd 
+                ON rd.rr_no = df.rr_no 
+                AND rd.rr_detail_id = r.rr_detail_id
+                AND rd.status = 'Deployed'
+            GROUP BY p.prs_id
+        ) AS deployed_sub ON deployed_sub.prs_id = p.prs_id
+
+        $whereClause
+
+        GROUP BY p.prs_code
+        ORDER BY
+            CASE
+                WHEN p.approval_status = 'Pending' THEN 1
+                WHEN p.approval_status = 'For Approval' THEN 2
+                WHEN p.approval_status = 'Approved' THEN 3
+                WHEN p.approval_status = 'Rejected' THEN 4
+                ELSE 5
+            END,
+            p.date_requested ASC
+    ";
+
+    $stmt = $db->prepare($query);
+    $stmt->execute($params);
+    $prs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Count total PRs
+    $countQuery = "SELECT COUNT(DISTINCT p.prs_code) FROM dbpis_prs p $whereClause";
+    $totalStmt = $db->prepare($countQuery);
+    $totalStmt->execute($params);
+    $totalCount = $totalStmt->fetchColumn();
+
+    return ["prs" => $prs, "total_count" => $totalCount];
+}
+
+
+
+
+function fetchPendingPRsForDeptHead($db, $deptHeadName) {
+    $query = "
+        SELECT
+            prs.*,
+            unit.unit_name,
+            IF(purchased_sub.count > 0, 1, 0) AS has_purchased,
+
+            -- Receive status
+            CASE 
+                WHEN received_sub.match_count = received_sub.total_count THEN 'Fully Received'
+                WHEN received_sub.partial_match_count > 0 THEN 'Partially Received'
+                ELSE 'Not Received'
+            END AS receive_status,
+
+            -- Deploy status
+            CASE 
+                WHEN deployed_sub.total_deployed = deployed_sub.total_received AND deployed_sub.total_received > 0 THEN 'Fully Deployed'
+                WHEN deployed_sub.total_deployed > 0 THEN 'Partially Deployed'
+                ELSE 'Not Deployed'
+            END AS deploy_status
+
+        FROM dbpis_prs AS prs
+
+        LEFT JOIN dbpis_unit AS unit ON prs.unit_id = unit.unit_id
+
+        -- Purchased items subquery
+        LEFT JOIN (
+            SELECT 
+                d.prs_code,
+                COUNT(*) AS count
+            FROM dbpis_prsdetails d
+            WHERE 
+                d.status IN (1, 2, 3)
+                AND d.unit_price IS NOT NULL AND d.unit_price != 0
+                AND d.total_price IS NOT NULL AND d.total_price != 0
+            GROUP BY d.prs_code
+        ) AS purchased_sub ON purchased_sub.prs_code = prs.prs_code
+
+        -- Received items subquery
+        LEFT JOIN (
+            SELECT 
+                sub.prs_code,
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN sub.received_qty >= sub.requested_qty THEN 1 ELSE 0 END) AS match_count,
+                SUM(CASE WHEN sub.received_qty > 0 AND sub.received_qty < sub.requested_qty THEN 1 ELSE 0 END) AS partial_match_count
+            FROM (
+                SELECT 
+                    d.prs_code,
+                    d.item_code,
+                    d.quantity AS requested_qty,
+                    IFNULL(SUM(r.quantity), 0) AS received_qty
+                FROM dbpis_prsdetails d
+                LEFT JOIN dbpis_prs p ON d.prs_code = p.prs_code
+                LEFT JOIN dbpis_rr_details r 
+                    ON r.prs_id = p.prs_id 
+                    AND r.particulars = d.item_code
+                WHERE d.status != 0
+                GROUP BY d.prs_code, d.item_code
+            ) AS sub
+            GROUP BY sub.prs_code
+        ) AS received_sub ON received_sub.prs_code = prs.prs_code
+
+        -- Deployed items subquery
+        LEFT JOIN (
+            SELECT 
+                p.prs_id,
+                COUNT(DISTINCT r.rr_detail_id) AS total_received,
+                COUNT(DISTINCT rd.rr_detail_id) AS total_deployed
+            FROM dbpis_prs p
+            LEFT JOIN dbpis_rr_details r 
+                ON r.prs_id = p.prs_id
+            LEFT JOIN dbpis_df df 
+                ON FIND_IN_SET(r.rr_no, df.rr_no) > 0
+            LEFT JOIN dbpis_rr_details rd 
+                ON rd.rr_no = df.rr_no 
+                AND rd.rr_detail_id = r.rr_detail_id
+                AND rd.status = 'Deployed'
+            GROUP BY p.prs_id
+        ) AS deployed_sub ON deployed_sub.prs_id = prs.prs_id
+
+        WHERE 
+            prs.approval_status <> 'Cancelled'
+            AND (prs.dept_head IS NULL OR TRIM(prs.dept_head) = '' OR prs.dept_head = ?)
+
+        ORDER BY
+            CASE
+                WHEN prs.approval_status = 'Pending' AND (prs.dept_head IS NULL OR TRIM(prs.dept_head) = '') THEN 0
+                WHEN prs.approval_status = 'Pending' THEN 1
+                ELSE 2
+            END,
+            prs.date_requested ASC
+    ";
+
+    $stmt = $db->prepare($query);
+    $stmt->execute([$deptHeadName]);
+    $prs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $totalStmt = $db->prepare("
+        SELECT COUNT(*) 
+        FROM dbpis_prs 
+        WHERE (dept_head IS NULL OR TRIM(dept_head) = '' OR dept_head = ?)
+        AND approval_status <> 'Cancelled'
+    ");
+    $totalStmt->execute([$deptHeadName]);
+    $totalCount = $totalStmt->fetchColumn();
+
+    return [
+        "prs" => $prs,
+        "total_count" => $totalCount
+    ];
+}
+
+
+
+
+function fetchPRsByRequestor($db) {
+    if (session_status() == PHP_SESSION_NONE) {
+        session_start();
+    }
+
+    $requestor = $_SESSION['name'] ?? '';
+
+    $query = "
+        SELECT 
+            prs.*, 
+            unit.unit_name,
+            IF(purchased_sub.count > 0, 1, 0) AS has_purchased,
+
+            -- Receive status
+            CASE 
+                WHEN received_sub.match_count = received_sub.total_count THEN 'Fully Received'
+                WHEN received_sub.partial_match_count > 0 THEN 'Partially Received'
+                ELSE 'Not Received'
+            END AS receive_status,
+
+            -- Deploy status
+            CASE 
+                WHEN deployed_sub.total_deployed = deployed_sub.total_received AND deployed_sub.total_received > 0 THEN 'Fully Deployed'
+                WHEN deployed_sub.total_deployed > 0 THEN 'Partially Deployed'
+                ELSE 'Not Deployed'
+            END AS deploy_status
+
+        FROM 
+            dbpis_prs AS prs
+
+        LEFT JOIN 
+            dbpis_unit AS unit ON prs.unit_id = unit.unit_id
+
+        -- Purchased items subquery
+        LEFT JOIN (
+            SELECT 
+                d.prs_code,
+                COUNT(*) AS count
+            FROM 
+                dbpis_prsdetails d
+            WHERE 
+                d.status IN (1, 2, 3)
+                AND d.unit_price IS NOT NULL AND d.unit_price != 0
+                AND d.total_price IS NOT NULL AND d.total_price != 0
+            GROUP BY 
+                d.prs_code
+        ) AS purchased_sub ON purchased_sub.prs_code = prs.prs_code
+
+        -- Received items subquery
+        LEFT JOIN (
+            SELECT 
+                sub.prs_code,
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN sub.received_qty >= sub.requested_qty THEN 1 ELSE 0 END) AS match_count,
+                SUM(CASE WHEN sub.received_qty > 0 AND sub.received_qty < sub.requested_qty THEN 1 ELSE 0 END) AS partial_match_count
+            FROM (
+                SELECT 
+                    d.prs_code,
+                    d.item_code,
+                    d.quantity AS requested_qty,
+                    IFNULL(SUM(r.quantity), 0) AS received_qty
+                FROM 
+                    dbpis_prsdetails d
+                LEFT JOIN dbpis_prs p ON d.prs_code = p.prs_code
+                LEFT JOIN dbpis_rr_details r 
+                    ON r.prs_id = p.prs_id 
+                    AND r.particulars = d.item_code
+                WHERE 
+                    d.status != 0
+                GROUP BY 
+                    d.prs_code, d.item_code
+            ) AS sub
+            GROUP BY 
+                sub.prs_code
+        ) AS received_sub ON received_sub.prs_code = prs.prs_code
+
+        -- Deployed items subquery
+        LEFT JOIN (
+            SELECT 
+                p.prs_id,
+                COUNT(DISTINCT r.rr_detail_id) AS total_received,
+                COUNT(DISTINCT rd.rr_detail_id) AS total_deployed
+            FROM dbpis_prs p
+            LEFT JOIN dbpis_rr_details r 
+                ON r.prs_id = p.prs_id
+            LEFT JOIN dbpis_df df 
+                ON FIND_IN_SET(r.rr_no, df.rr_no) > 0
+            LEFT JOIN dbpis_rr_details rd 
+                ON rd.rr_no = df.rr_no 
+                AND rd.rr_detail_id = r.rr_detail_id
+                AND rd.status = 'Deployed'
+            GROUP BY p.prs_id
+        ) AS deployed_sub ON deployed_sub.prs_id = prs.prs_id
+
+        WHERE 
+            prs.requested_by = ?
+        ORDER BY
+            CASE prs.approval_status
+                WHEN 'Pending' THEN 0
+                WHEN 'Canceled' THEN 1
+                WHEN 'Rejected' THEN 2
+                WHEN 'Approved' THEN 3
+                ELSE 4
+            END,
+            prs.date_requested DESC
+    ";
+
+    $stmt = $db->prepare($query);
+    $stmt->execute([$requestor]);
+    $prs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Total count of PRs
+    $totalStmt = $db->prepare("SELECT COUNT(*) FROM dbpis_prs WHERE requested_by = ?");
+    $totalStmt->execute([$requestor]);
+    $totalCount = $totalStmt->fetchColumn();
+
+    return [
+        "prs" => $prs,
+        "total_count" => $totalCount
+    ];
+}
+
+function getIncomingAndCompletedStats($db, $modid, $requested_by = null) {
+    $query = "
+        SELECT
+            SUM(CASE WHEN pd.status IN (1, 3) THEN 1 ELSE 0 END) AS incoming_items,
+            SUM(CASE WHEN pd.status = 2 THEN 1 ELSE 0 END) AS completed_items
+        FROM dbpis_prsdetails pd
+        JOIN dbpis_prs pr ON pd.prs_code = pr.prs_code
+        JOIN dbpis_items i ON pd.item_code = i.barcode
+        LEFT JOIN (
+            SELECT 
+                particulars, 
+                prs_id,
+                SUM(quantity) AS total_rr_quantity
+            FROM dbpis_rr_details
+            GROUP BY particulars, prs_id
+        ) AS rr_summary 
+            ON rr_summary.particulars = pd.item_code 
+            AND rr_summary.prs_id = pr.prs_id
+        WHERE pr.approval_status = 'approved'
+        AND pd.status IN (1, 2, 3)
+        AND pd.unit_price IS NOT NULL
+        AND pd.total_price IS NOT NULL
+    ";
+
+    if ($modid == 2 && $requested_by) {
+        $query .= " AND pr.requested_by = :requested_by";
+    }
+
+    $stmt = $db->prepare($query);
+
+    if ($modid == 2 && $requested_by) {
+        $stmt->bindParam(':requested_by', $requested_by);
+    }
+
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+
+
+
+
+
+
+
+function getNextPrCode($db) {
+    $query = "SELECT prs_code FROM dbpis_prs ORDER BY prs_id DESC LIMIT 1";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($row && is_numeric($row['prs_code'])) {
+        $nextNumber = (int)$row['prs_code'] + 1;
+    } else {
+        $nextNumber = 2024001; // Default starting PR Code
+    }
+
+    return $nextNumber;
+}
+
+    public function deletePR($db, $prs_code) {
+        $db->beginTransaction(); // Start transaction
+
+        try {
+            // Delete from PR details table
+            $stmt1 = $db->prepare("DELETE FROM dbpis_prsdetails WHERE prs_code = ?");
+            $stmt1->execute([$prs_code]);
+
+            // Delete from PR main table
+            $stmt2 = $db->prepare("DELETE FROM dbpis_prs WHERE prs_code = ?");
+            $stmt2->execute([$prs_code]);
+
+            $db->commit(); // Commit transaction
+            return true;
+        } catch (Exception $e) {
+            $db->rollBack(); // Rollback on failure
+            return false;
+        }
+    }
+
+function getDepartments($db) {
+    $query = "SELECT dept_id, dept_name FROM dbpis_department ORDER BY dept_name ASC";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+function getUnits($db) {
+    $query = "SELECT unit_id, unit_name FROM dbpis_unit";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+
+function getInventoryItems($db) {
+    try {
+        $query = "SELECT barcode, particular, brand FROM dbpis_items ORDER BY particular ASC";
+        $stmt = $db->prepare($query);
+        $stmt->execute();
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        return ['error' => 'Database error: ' . $e->getMessage()];
+    }
+}
+
+function insertPR($db, $prs_code, $requested_by, $department, $unit_id, $date_requested, $date_needed, $approval_status, $remarks) {
+    $stmt = $db->prepare("INSERT INTO dbpis_prs (prs_code, requested_by, department, unit_id, date_requested, date_needed, approval_status, remarks)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+    $stmt->execute([$prs_code, $requested_by, $department, $unit_id, $date_requested, $date_needed, $approval_status, $remarks]);
+}
+
+
+// Function to insert PR details
+function insertPRDetails($db, $prs_code, $item_code, $item_description, $quantity, $unit_type) {
+    $stmt = $db->prepare("INSERT INTO dbpis_prsdetails (prs_code, item_code, item_description, quantity, unit_type)
+                          VALUES (?, ?, ?, ?, ?)");
+    $stmt->execute([$prs_code, $item_code, $item_description, $quantity, $unit_type]);
+}
+
+function updatePurchaseRequisition($db, $prs_code, $requested_by, $department, $unit_id, $date_requested, $date_needed, $remarks, $items) {
+    try {
+        $db->beginTransaction();
+
+        // Update main PR table including the unit_id
+        $stmt = $db->prepare("UPDATE dbpis_prs
+                              SET requested_by = ?, department = ?, unit_id = ?, date_requested = ?, date_needed = ?, remarks = ?
+                              WHERE prs_code = ?");
+        $stmt->execute([$requested_by, $department, $unit_id, $date_requested, $date_needed, $remarks, $prs_code]);
+
+        // Delete existing PR details
+        $stmt = $db->prepare("DELETE FROM dbpis_prsdetails WHERE prs_code = ?");
+        $stmt->execute([$prs_code]);
+
+        // Insert new PR details (excluding supplier, unit price, and total price)
+        $stmt = $db->prepare("INSERT INTO dbpis_prsdetails (prs_code, item_code, item_description, quantity, unit_type)
+                              VALUES (?, ?, ?, ?, ?)");
+        foreach ($items as $item) {
+            $stmt->execute([
+                $prs_code,
+                $item['item_code'],
+                $item['item_description'],
+                $item['quantity'],
+                $item['unit_type']
+            ]);
+        }
+
+        $db->commit();
+        return ["success" => true];
+    } catch (Exception $e) {
+        $db->rollBack();
+        return ["success" => false, "error" => $e->getMessage()];
+    }
+}
+
+
+function getPurchaseRequisitionDetails($db, $prs_code) {
+    $stmt = $db->prepare("SELECT * FROM dbpis_prs WHERE prs_code = ?");
+    $stmt->execute([$prs_code]);
+    $prs = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    $stmt = $db->prepare("SELECT * FROM dbpis_prsdetails WHERE prs_code = ?");
+    $stmt->execute([$prs_code]);
+    $details = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    return $prs ? ["success" => true, "prs" => $prs, "details" => $details] : ["success" => false];
+}
+
+    public function getCategorizedItems($db) {
+        try {
+            $stmt = $db->prepare("
+                SELECT
+                    dbpis_items.barcode,
+                    dbpis_items.particular,
+                    dbpis_items.brand,
+                    dbpis_item_category.itcat_name,
+                    dbpis_itemcategory_group.itemcatgrp_name,
+                    dbpis_items.category
+                FROM dbpis_items
+                JOIN dbpis_item_category ON dbpis_items.category = dbpis_item_category.itcat_id
+                JOIN dbpis_itemcategory_group ON dbpis_item_category.itemcatgrp_id = dbpis_itemcategory_group.itemcatgrp_id
+            ");
+            $stmt->execute();
+            $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if ($items) {
+                return $items;
+            } else {
+                return ["success" => false, "message" => "No items found."];
+            }
+
+        } catch (PDOException $e) {
+            error_log("Database Error: " . $e->getMessage());
+            return ["success" => false, "message" => "Database error: " . $e->getMessage()];
+        }
+    }
+
+    public function getCategories($db) {
+    $stmt = $db->query("
+        SELECT 
+            c.itcat_id, 
+            c.itcat_name, 
+            g.itemcatgrp_name 
+        FROM dbpis_item_category c
+        LEFT JOIN dbpis_itemcategory_group g ON c.itemcatgrp_id = g.itemcatgrp_id
+        ORDER BY g.itemcatgrp_name ASC, c.itcat_name ASC
+    ");
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+public function getCategorizedItems1($db) {
+    $stmt = $db->prepare("SELECT barcode, particular AS description, category FROM dbpis_items ORDER BY particular");
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+
+
+
+
+
+
+}

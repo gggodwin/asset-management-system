@@ -1,0 +1,508 @@
+<?php
+class CUSTODIAN {
+
+function getInventorySummary($db, $modid) {
+    if ($modid == 1) {
+        // Property Custodian: tagged and untagged logic
+        $query = "
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM dbpis_eq_tagging
+                    WHERE status = 'Deployed'
+                ) AS total_items,
+
+                (
+                    SELECT COUNT(*)
+                    FROM dbpis_eq_tagging eq
+                    WHERE eq.status = 'Processing'
+                ) AS low_stock_items,
+
+                (
+                    SELECT COUNT(DISTINCT category)
+                    FROM dbpis_items
+                    WHERE category != 'consumables'
+                ) AS total_categories,
+
+                (
+                    SELECT COUNT(*)
+                    FROM dbpis_items
+                    WHERE DATE(last_updated) = CURDATE()
+                      AND category != 'consumables'
+                ) AS recently_updated_items
+        ";
+    } else {
+        // Other roles: count items in RR details whose category is 401–405
+        $query = "
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM dbpis_items
+                ) AS total_items,
+
+                (
+                    SELECT COUNT(*)
+                    FROM dbpis_rr_details r
+                    JOIN dbpis_items i ON r.particulars = i.barcode
+                    WHERE i.category BETWEEN 401 AND 405
+                        OR i.category IN (101, 201, 301)
+                ) AS low_stock_items,  -- This now reflects Non-CAPEX items
+
+                (
+                    SELECT COUNT(DISTINCT category)
+                    FROM dbpis_items
+                ) AS total_categories,
+
+                (
+                    SELECT COUNT(*)
+                    FROM dbpis_items
+                    WHERE DATE(last_updated) = CURDATE()
+                ) AS recently_updated_items
+        ";
+    }
+
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+    public function getTaggedItemsCount($db) {
+        $query = "
+            SELECT COUNT(DISTINCT d.it_no)
+            FROM dbpis_eq_tag_details d
+            JOIN dbpis_items i ON d.it_no = i.barcode
+            WHERE i.category != 'consumables'
+        ";
+
+        // Assuming $db is the database connection
+        $result = $db->query($query);
+        $count = $result->fetchColumn(); // Fetch the count value
+        return $count;
+    }
+
+
+    function getCategories($db) {
+        try {
+            $stmt = $db->query("SELECT DISTINCT category FROM dbpis_items ORDER BY category ASC");
+            return $stmt->fetchAll(PDO::FETCH_COLUMN); // Fetch as an array
+        } catch (PDOException $e) {
+            error_log("Database error: " . $e->getMessage()); // Log error instead of stopping execution
+            return []; // Return an empty array if there's an error
+        }
+    }
+
+    public function getTotalItemsCount($db) {
+        $query = "SELECT COUNT(*) AS total FROM dbpis_items";
+        $stmt = $db->prepare($query);
+        $stmt->execute();
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $result['total'] ?? 0;
+    }
+
+    public function updateItem($db, $barcode, $particular, $brand, $category, $quantity, $units) {
+        // Prepare the SQL query for updating the item using ? placeholders
+        $query = "UPDATE dbpis_items
+                  SET particular = ?, brand = ?, category = ?, quantity = ?, units = ?, last_updated = NOW()
+                  WHERE barcode = ?";
+
+        // Prepare the statement
+        $stmt = $db->prepare($query);
+
+        // Create an array of values in the correct order
+        $values = [
+            $particular, $brand, $category, $quantity, $units, $barcode
+        ];
+
+        // Bind all values dynamically
+        foreach ($values as $index => $value) {
+            $stmt->bindValue($index + 1, $value, is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR);
+        }
+
+        // Execute the query and return the result
+        if ($stmt->execute()) {
+            return ['success' => true, 'message' => 'Item updated successfully'];
+        } else {
+            return ['success' => false, 'message' => 'Failed to update item in the database'];
+        }
+    }
+
+    public function addItem($db, $barcode, $particular, $brand, $category, $quantity, $units) {
+        // Prepare the SQL query
+        $stmt = $db->prepare("INSERT INTO dbpis_items (barcode, particular, brand, category, quantity, units, last_updated)
+                              VALUES (?, ?, ?, ?, ?, ?, NOW())");
+
+        // Execute the query
+        return $stmt->execute([$barcode, $particular, $brand, $category, $quantity, $units]);
+    }
+
+    public function getNextBarcode($db) {
+        // Prepare the query to fetch the latest barcode
+        $query = "SELECT barcode FROM dbpis_items ORDER BY barcode DESC LIMIT 1";
+        $stmt = $db->prepare($query);
+        $stmt->execute();
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        // Generate the next barcode
+        if ($result && isset($result['barcode'])) {
+            return intval($result['barcode']) + 1;
+        } else {
+            return 100001; // Start from 100001 if no records exist
+        }
+    }
+
+public function getItemByBarcode($db, $barcode) {
+    $stmt = $db->prepare("
+        SELECT
+            i.*,
+            eq.eq_no AS eq_tagging_eq_no,
+            eq.emp_id AS eq_tagging_emp_id,
+            eq.eq_loc AS eq_tagging_eq_loc,
+            eq.eq_date AS eq_tagging_eq_date,
+            eqd.eqd_id AS eq_tag_details_eqd_id,
+            eqd.eq_no AS eq_tag_details_eq_no,
+            eqd.it_no AS eq_tag_details_it_no,
+            eqd.pr_code AS eq_tag_details_pr_code,
+            eqd.eq_remarks AS eq_tag_details_eq_remarks,
+            eqd.quantity AS eq_tag_details_quantity
+        FROM
+            dbpis_items i
+        LEFT JOIN
+            dbpis_eq_tag_details eqd ON i.barcode = eqd.it_no
+        LEFT JOIN
+            dbpis_eq_tagging eq ON eqd.eq_no = eq.eq_no
+        WHERE
+            i.barcode = :barcode
+    ");
+    $stmt->bindValue(":barcode", $barcode, PDO::PARAM_STR);
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC); // Use fetchAll to get all matching rows
+}
+
+    public function getConsumableItemByBarcode($db, $barcode) {
+        $stmt = $db->prepare("SELECT * FROM dbpis_items WHERE barcode = :barcode AND category IN (401, 402, 403, 404, 405);");
+        $stmt->bindValue(":barcode", $barcode, PDO::PARAM_STR);
+        $stmt->execute();
+        return $stmt->fetch(PDO::FETCH_ASSOC);
+    }
+
+    public function getAllConsumableItemsWithSummary($db) {
+        $stmt = $db->prepare("SELECT * FROM dbpis_items WHERE category IN (401, 402, 403, 404, 405)");
+        $stmt->execute();
+        $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Calculate summary (e.g., total count of consumables)
+        $summary = [
+            "total_items" => count($items),
+        ];
+
+        return ["items" => $items, "summary" => $summary];
+    }
+
+public function getInventoryWithSummary($db, $modid) {
+    $summary = [];
+
+    // 1. Fetch Items (common to both roles)
+    $stmt = $db->query("
+        SELECT 
+            i.barcode, i.particular, i.brand, 
+            COALESCE(SUM(r.quantity), 0) AS quantity, 
+            i.units, i.category, c.itcat_name, g.itemcatgrp_name, 
+            i.last_updated 
+        FROM dbpis_items i 
+        LEFT JOIN dbpis_item_category c ON i.category = c.itcat_id 
+        LEFT JOIN dbpis_itemcategory_group g ON c.itemcatgrp_id = g.itemcatgrp_id 
+        LEFT JOIN dbpis_rr_details r ON i.barcode = r.particulars 
+        GROUP BY i.barcode, i.particular, i.brand, i.units, i.category, c.itcat_name, g.itemcatgrp_name, i.last_updated
+    ");
+    $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // 2. Summary Logic
+    if ($modid == 1) {
+        // Property Custodian Role
+        $stmt = $db->query("SELECT COUNT(*) AS total_items FROM dbpis_eq_tagging WHERE status = 'Deployed'");
+        $summary['total_items'] = $stmt->fetchColumn();
+
+        $stmt = $db->query("SELECT COUNT(*) AS low_stock_items FROM dbpis_eq_tagging WHERE status = 'Processing'");
+        $summary['low_stock_items'] = $stmt->fetchColumn();
+
+        $stmt = $db->query("SELECT COUNT(DISTINCT category) AS total_categories FROM dbpis_items WHERE category != 'consumables'");
+        $summary['total_categories'] = $stmt->fetchColumn();
+
+        $stmt = $db->query("SELECT COUNT(*) AS recently_updated_items FROM dbpis_items WHERE DATE(last_updated) = CURDATE() AND category != 'consumables'");
+        $summary['recently_updated_items'] = $stmt->fetchColumn();
+    } else {
+        // Other Roles
+        $stmt = $db->query("SELECT COUNT(*) AS total_items FROM dbpis_items");
+        $summary['total_items'] = $stmt->fetchColumn();
+
+        $stmt = $db->query("
+            SELECT COUNT(*) AS low_stock_items 
+            FROM dbpis_rr_details r 
+            JOIN dbpis_items i ON r.particulars = i.barcode 
+            WHERE i.category BETWEEN 401 AND 405 OR i.category IN (101, 201, 301)
+        ");
+        $summary['low_stock_items'] = $stmt->fetchColumn();
+
+        $stmt = $db->query("SELECT COUNT(DISTINCT category) AS total_categories FROM dbpis_items");
+        $summary['total_categories'] = $stmt->fetchColumn();
+
+        $stmt = $db->query("SELECT COUNT(*) AS recently_updated_items FROM dbpis_items WHERE DATE(last_updated) = CURDATE()");
+        $summary['recently_updated_items'] = $stmt->fetchColumn();
+    }
+
+    return ['items' => $items, 'summary' => $summary];
+}
+
+
+
+    public function deleteItemByBarcode($db, $barcode) {
+        $deleteQuery = "DELETE FROM dbpis_items WHERE barcode = :barcode";
+        $stmtDelete = $db->prepare($deleteQuery);
+        $stmtDelete->bindParam(':barcode', $barcode, PDO::PARAM_STR);
+
+        return $stmtDelete->execute();
+    }
+
+public function fetchAllEquipmentTagging($db) {
+    $sql = "SELECT eq.eq_no, eq.emp_id,
+       CONCAT(s.surname, ', ', s.firstname, ' ', IFNULL(s.midname, ''), ' ', IFNULL(s.extension, '')) AS emp_name,
+       eq.eq_loc, eq.eq_date, eq.status, u.unit_name,
+       ROUND(AVG(d.expected_life_span), 1) AS expected_life_span,
+       DATE_ADD(eq.eq_date, INTERVAL ROUND(AVG(d.expected_life_span) * 12, 0) MONTH) AS expected_end_date
+FROM dbpis_eq_tagging eq
+LEFT JOIN dbpis_staff s ON eq.emp_id = s.staff_id
+LEFT JOIN dbpis_unit u ON eq.eq_loc = u.unit_id
+LEFT JOIN dbpis_eq_tag_details d ON eq.eq_no = d.eq_no
+GROUP BY eq.eq_no, eq.emp_id, emp_name, eq.eq_loc, eq.eq_date, eq.status, u.unit_name
+ORDER BY
+    CASE eq.status
+        WHEN 'Processing' THEN 0
+        ELSE 1
+    END,
+    eq.eq_no ASC
+";
+
+    $stmt = $db->prepare($sql);
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+
+    // Fetch equipment tagging details by eq_no
+    public function fetchEquipmentTaggingDetails($db, $eq_no) {
+        // Fetch main eq_tagging data
+        $stmt = $db->prepare("SELECT * FROM dbpis_eq_tagging WHERE eq_no = :eq_no");
+        $stmt->bindParam(':eq_no', $eq_no);
+        $stmt->execute();
+        $eqData = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($eqData) {
+            // Fetch related eq_tagging_details
+            $detailStmt = $db->prepare("SELECT * FROM dbpis_eq_tagging_details WHERE eq_no = :eq_no");
+            $detailStmt->bindParam(':eq_no', $eq_no);
+            $detailStmt->execute();
+            $eqDetails = $detailStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            return [
+                "success" => true,
+                "data" => $eqData,
+                "details" => $eqDetails
+            ];
+        } else {
+            return ["success" => false, "message" => "Equipment not found"];
+        }
+    }
+
+        // Function to fetch eq_tagging and eq_tagging_details based on eq_no
+    public function fetchEqTaggingDetails($db, $eq_no) {
+        // Fetch eq_tagging header with employee name
+        $query = "
+            SELECT
+                eq.emp_id, eq.eq_no, eq.eq_date, eq.eq_loc,
+                CONCAT(s.surname, ', ', s.firstname, ' ', IFNULL(s.midname, ''), ' ', IFNULL(s.extension, '')) AS emp_name
+            FROM dbpis_eq_tagging eq
+            LEFT JOIN dbpis_staff s ON eq.emp_id = s.staff_id
+            WHERE eq.eq_no = :eq_no
+        ";
+        $stmt = $db->prepare($query);
+        $stmt->bindParam(':eq_no', $eq_no, PDO::PARAM_STR);
+        $stmt->execute();
+        $eq_tagging = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        // Fetch eq_tagging_details with item description, quantity, and expected life span
+        $query_details = "
+            SELECT
+                d.it_no,
+                d.pr_code,
+                d.eq_remarks,
+                d.quantity,
+                d.expected_life_span,
+                DATE_ADD(eq.eq_date, INTERVAL ROUND(d.expected_life_span * 12, 0) MONTH) AS expected_end_date,
+                CONCAT(i.brand, ' - ', i.particular) AS item_description
+            FROM dbpis_eq_tag_details d
+            LEFT JOIN dbpis_items i ON d.it_no = i.barcode
+            LEFT JOIN dbpis_eq_tagging eq ON d.eq_no = eq.eq_no
+            WHERE d.eq_no = :eq_no
+        ";
+        $stmt_details = $db->prepare($query_details);
+        $stmt_details->bindParam(':eq_no', $eq_no, PDO::PARAM_STR);
+        $stmt_details->execute();
+        $eq_tagging_details = $stmt_details->fetchAll(PDO::FETCH_ASSOC);
+
+        return [
+            'eq_tagging' => $eq_tagging,
+            'eq_tagging_details' => $eq_tagging_details
+        ];
+    }
+
+
+        public function getEmployees($db) {
+            $query = "
+                SELECT staff_id, CONCAT(surname, ', ', firstname, ' ', IFNULL(midname, ''), ' ', IFNULL(extension, '')) AS emp_name
+                FROM dbpis_staff
+            ";
+            $stmt = $db->prepare($query);
+            $stmt->execute();
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        public function getTransfers($db) {
+            $sql = "SELECT
+    t.trans_id,
+    t.eq_no,
+    COALESCE(ou.unit_name, ou2.unit_name) AS old_unit,
+    du.unit_name AS new_unit,
+    t.transfer_date,
+    t.received_by
+FROM
+    dbpis_transfer t
+LEFT JOIN dbpis_unit ou ON t.old_unit = ou.unit_id
+LEFT JOIN dbpis_unit ou2 ON t.old_unit = ou2.unit_name
+LEFT JOIN dbpis_unit du ON t.dept_unit = du.unit_id
+ORDER BY
+    t.transfer_date DESC;
+";
+
+            $stmt = $db->prepare($sql);
+            $stmt->execute();
+
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+                // 1. PRS History
+        public function getItemPRSHistory($db, $it_no) {
+            $stmt = $db->prepare("
+                SELECT 
+                    prs_code, item_description, quantity, supplier, 
+                    unit_price, total_price, unit_type
+                FROM dbpis_prsdetails 
+                WHERE item_code = ?
+            ");
+            $stmt->execute([$it_no]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        // 2. RR History
+        public function getItemRRHistory($db, $it_no) {
+            $stmt = $db->prepare("
+                SELECT 
+                    rr_no, quantity, unit, 
+                    unit_price, total_price, created_at AS date_received 
+                FROM dbpis_rr_details 
+                WHERE particulars = ?
+            ");
+            $stmt->execute([$it_no]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        // 3. EQ Tagging History
+        public function getItemEQHistory($db, $it_no) {
+            $stmt = $db->prepare("
+                SELECT
+                    etd.eq_no,
+                    etd.pr_code,
+                    eq.emp_id,
+                    eq.eq_date,
+                    eq.eq_dept,
+                    eq.rr_no,
+                    CASE
+                        WHEN CAST(eq.eq_loc AS UNSIGNED) > 0 THEN u.unit_name
+                        ELSE eq.eq_loc
+                    END AS eq_location_display,
+                    etd.eq_remarks
+                FROM
+                    dbpis_eq_tag_details etd
+                LEFT JOIN
+                    dbpis_eq_tagging eq ON etd.eq_no = eq.eq_no
+                LEFT JOIN
+                    dbpis_unit u ON CAST(eq.eq_loc AS UNSIGNED) = u.unit_id
+                WHERE it_no = ?
+            ");
+            $stmt->execute([$it_no]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        public function getItemTransferHistory($db, $barcode) {
+            $stmt = $db->prepare("
+               SELECT
+    t.trans_id,
+    t.eq_no,
+    COALESCE(u_old.unit_name, u_old2.unit_name) AS from_location,
+    u_dept.unit_name AS to_location,
+    t.transfer_date
+FROM
+    dbpis_transfer t
+LEFT JOIN
+    dbpis_unit u_old ON t.old_unit = u_old.unit_id
+LEFT JOIN
+    dbpis_unit u_old2 ON t.old_unit = u_old2.unit_name
+LEFT JOIN
+    dbpis_unit u_dept ON t.dept_unit = u_dept.unit_id
+INNER JOIN
+    dbpis_eq_tag_details etd ON t.eq_no = etd.eq_no
+INNER JOIN
+    dbpis_items i ON etd.it_no = i.barcode
+WHERE
+    i.barcode = ?
+ORDER BY
+    t.transfer_date DESC;
+
+            ");
+            $stmt->execute([$barcode]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+            public function getAssetManagement($db) {
+        $query = "
+            SELECT 
+                i.particular AS item_name,  -- or i.barcode if the join is on barcode
+                d.dept_name AS department,
+                u.unit_name AS unit_location,
+                rrd.unit_price,
+                rr.rr_no,
+                rr.date_received,
+                prs.prs_code,
+                prs.date_requested AS prs_date,
+                rrd.unit_price,
+                rrd.quantity,
+                (rrd.unit_price * rrd.quantity) AS total_amount,
+                CASE 
+                    WHEN i.category BETWEEN 401 AND 405 OR i.category IN (101, 201, 301) 
+                    THEN 'NON-CAPEX'
+                    ELSE 'CAPEX'
+                END AS capex_type
+            FROM dbpis_rr_details rrd
+            LEFT JOIN dbpis_rr rr ON rrd.rr_no = rr.rr_no
+            LEFT JOIN dbpis_items i ON rrd.particulars = i.barcode 
+            LEFT JOIN dbpis_prs prs ON rrd.prs_id = prs.prs_id
+            LEFT JOIN dbpis_department d ON prs.department = d.dept_name  
+            LEFT JOIN dbpis_unit u ON prs.unit_id = u.unit_id
+            ORDER BY rr.date_received DESC;
+        ";
+
+        $stmt = $db->prepare($query);
+        $stmt->execute();
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+}
